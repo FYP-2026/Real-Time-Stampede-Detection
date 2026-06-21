@@ -1,0 +1,10 @@
+fastapi
+   uvicorn[standard]
+   torch
+   torchvision
+   opencv-python
+   huggingface_hub
+   sqlalchemy
+   python-dotenv
+   websockets
+   numpy

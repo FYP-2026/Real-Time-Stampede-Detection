@@ -1,0 +1,169 @@
+import torch
+import torch.nn as nn
+import cv2
+import numpy as np
+from collections import deque
+from torchvision import transforms
+from huggingface_hub import hf_hub_download
+
+
+class CSRNet(nn.Module):
+    def __init__(self):
+        super(CSRNet, self).__init__()
+        self.frontend_feat = [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512]
+        self.backend_feat  = [512, 512, 512, 256, 128, 64]
+        self.frontend = make_layers(self.frontend_feat)
+        self.backend  = make_layers(self.backend_feat, in_channels=512, dilation=True)
+        self.output_layer = nn.Conv2d(64, 1, kernel_size=1)
+
+    def forward(self, x):
+        x = self.frontend(x)
+        x = self.backend(x)
+        x = self.output_layer(x)
+        return x
+
+
+def make_layers(cfg, in_channels=3, dilation=False):
+    d_rate = 2 if dilation else 1
+    layers = []
+    for v in cfg:
+        if v == 'M':
+            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+        else:
+            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=d_rate, dilation=d_rate)
+            layers += [conv2d, nn.ReLU(inplace=True)]
+            in_channels = v
+    return nn.Sequential(*layers)
+
+
+_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+
+def load_model():
+    weights_path = hf_hub_download(repo_id="rootstrap-org/crowd-counting", filename="weights.pth")
+    model = CSRNet()
+    checkpoint = torch.load(weights_path, map_location='cpu')
+    model.load_state_dict(checkpoint)
+    model.eval()
+    print("CSRNet model loaded successfully.")
+    return model
+
+
+def estimate_density(model, frame):
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img_tensor = _transform(img).unsqueeze(0)
+    with torch.no_grad():
+        output = model(img_tensor)
+    return output.sum().item()
+
+
+# ---------------- Motion Analyzer ----------------
+class MotionAnalyzer:
+    """
+    Dense optical flow between consecutive frames.
+    avg_speed   : mean pixel displacement per frame (how fast crowd moves)
+    chaos_score : 0.0 = everyone moving same direction, 1.0 = pure random chaos
+    """
+    def __init__(self):
+        self.prev_gray = None
+
+    def analyze(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (15, 15), 0)
+
+        if self.prev_gray is None or self.prev_gray.shape != gray.shape:
+            self.prev_gray = gray
+            return {"avg_speed": 0.0, "chaos_score": 0.0}
+
+        flow = cv2.calcOpticalFlowFarneback(
+            self.prev_gray, gray, None,
+            pyr_scale=0.5, levels=3, winsize=15,
+            iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+        )
+        self.prev_gray = gray
+
+        magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        avg_speed = float(np.mean(magnitude))
+
+        # Circular variance: how spread out the directions are
+        sin_mean = np.mean(np.sin(angle))
+        cos_mean = np.mean(np.cos(angle))
+        r = np.sqrt(sin_mean**2 + cos_mean**2)
+        chaos_score = float(1.0 - r)
+
+        return {
+            "avg_speed":   round(avg_speed, 2),
+            "chaos_score": round(chaos_score, 3)
+        }
+
+
+# ---------------- Risk Classifier ----------------
+class RiskClassifier:
+    def __init__(self, window=3,
+                 density_very_high=900, density_high=750, density_medium=650,
+                 rate_very_high=60,     rate_high=35,     rate_medium=15,
+                 chaos_very_high=0.80,  chaos_high=0.65,  chaos_medium=0.45,
+                 speed_very_high=3.5,   speed_high=2.0):
+        self.buffer            = deque(maxlen=window)
+        self.density_very_high = density_very_high
+        self.density_high      = density_high
+        self.density_medium    = density_medium
+        self.rate_very_high    = rate_very_high
+        self.rate_high         = rate_high
+        self.rate_medium       = rate_medium
+        self.chaos_very_high   = chaos_very_high
+        self.chaos_high        = chaos_high
+        self.chaos_medium      = chaos_medium
+        self.speed_very_high   = speed_very_high
+        self.speed_high        = speed_high
+        self.last_smoothed     = None
+
+    def update(self, raw_count, motion=None):
+        self.buffer.append(raw_count)
+        smoothed = sum(self.buffer) / len(self.buffer)
+
+        rate = 0.0
+        if self.last_smoothed is not None:
+            rate = smoothed - self.last_smoothed
+        self.last_smoothed = smoothed
+
+        chaos = motion.get("chaos_score", 0.0) if motion else 0.0
+        speed = motion.get("avg_speed",   0.0) if motion else 0.0
+
+        very_high = (
+            smoothed > self.density_very_high or
+            rate     > self.rate_very_high    or
+            (smoothed > self.density_high and chaos > self.chaos_very_high) or
+            (speed   > self.speed_very_high  and chaos > self.chaos_very_high)
+        )
+        high = (
+            smoothed > self.density_high or
+            rate     > self.rate_high    or
+            (smoothed > self.density_medium and chaos > self.chaos_high) or
+            speed    > self.speed_high
+        )
+        medium = (
+            smoothed > self.density_medium or
+            rate     > self.rate_medium    or
+            chaos    > self.chaos_medium
+        )
+
+        if very_high:
+            risk = "Very High Risk"
+        elif high:
+            risk = "High Alert"
+        elif medium:
+            risk = "Medium Risk"
+        else:
+            risk = "No Risk"
+
+        return {
+            "density":        round(smoothed, 1),
+            "rate_of_change": round(rate, 1),
+            "avg_speed":      round(speed, 2),
+            "chaos_score":    round(chaos, 3),
+            "risk":           risk
+        }
