@@ -1,63 +1,64 @@
-import torch
-import torch.nn as nn
+import tensorflow as tf
 import cv2
 import numpy as np
 from collections import deque
-from torchvision import transforms
-from huggingface_hub import hf_hub_download
+import os
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), '67_precision49_recall.keras')
+def weighted_focal_loss(gamma=2.0, pos_weight=800.0):
+    bce = tf.keras.losses.BinaryFocalCrossentropy(gamma=gamma)
+    def loss(y_true, y_pred):
+        weights = 1.0 + y_true * (pos_weight - 1.0)
+        return tf.reduce_mean(bce(y_true, y_pred) * tf.squeeze(weights, -1))
+    return loss
 
 
-class CSRNet(nn.Module):
-    def __init__(self):
-        super(CSRNet, self).__init__()
-        self.frontend_feat = [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512]
-        self.backend_feat  = [512, 512, 512, 256, 128, 64]
-        self.frontend = make_layers(self.frontend_feat)
-        self.backend  = make_layers(self.backend_feat, in_channels=512, dilation=True)
-        self.output_layer = nn.Conv2d(64, 1, kernel_size=1)
+def make_inference_fn(model, pred_threshold, image_size):
+    h, w = image_size
 
-    def forward(self, x):
-        x = self.frontend(x)
-        x = self.backend(x)
-        x = self.output_layer(x)
-        return x
+    @tf.function(input_signature=[
+        tf.TensorSpec(shape=(1, h, w, 3), dtype=tf.float32)
+    ])
+    def infer(img_batch):
+        pred = model(img_batch, training=False)
+        pred = pred[0, ..., 0]
+        pred = tf.where(pred < pred_threshold, tf.zeros_like(pred), pred)
+        return pred
 
-
-def make_layers(cfg, in_channels=3, dilation=False):
-    d_rate = 2 if dilation else 1
-    layers = []
-    for v in cfg:
-        if v == 'M':
-            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
-        else:
-            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=d_rate, dilation=d_rate)
-            layers += [conv2d, nn.ReLU(inplace=True)]
-            in_channels = v
-    return nn.Sequential(*layers)
+    return infer
 
 
-_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+class CrowdModel:
+    def __init__(self, keras_model, pred_threshold=0.2, image_size=(400, 400)):
+        self.image_size = image_size
+        self.pred_threshold = pred_threshold
+        H, W = image_size
+        self.infer = make_inference_fn(keras_model, pred_threshold, image_size)
+        # warm-up: compiles the graph before live frames arrive
+        self.infer(tf.zeros((1, H, W, 3), dtype=tf.float32))
+        # pre-allocated inference buffer — reused every frame
+        self.img_batch = np.empty((1, H, W, 3), dtype=np.float32)
 
 
-def load_model():
-    weights_path = hf_hub_download(repo_id="rootstrap-org/crowd-counting", filename="weights.pth")
-    model = CSRNet()
-    checkpoint = torch.load(weights_path, map_location='cpu')
-    model.load_state_dict(checkpoint)
-    model.eval()
-    print("CSRNet model loaded successfully.")
-    return model
+def load_model(model_path = MODEL_PATH, pred_threshold=0.2, image_size=(400, 400)):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at: {model_path}")
+
+    keras_model = tf.keras.models.load_model(
+        model_path,
+        custom_objects={'loss': weighted_focal_loss()}
+    )
+    print("TF crowd model loaded successfully.")
+    return CrowdModel(keras_model, pred_threshold, image_size)
 
 
 def estimate_density(model, frame):
-    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img_tensor = _transform(img).unsqueeze(0)
-    with torch.no_grad():
-        output = model(img_tensor)
-    return output.sum().item()
+    H, W = model.image_size
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_rgb = cv2.resize(frame_rgb, (W, H))
+    np.multiply(frame_rgb, 1.0 / 255.0, out=model.img_batch[0])
+    pred_map = model.infer(model.img_batch).numpy()
+    return float(pred_map.sum())
 
 
 # ---------------- Motion Analyzer ----------------

@@ -1,10 +1,11 @@
 fastapi
-   uvicorn[standard]
-   torch
-   torchvision
-   opencv-python
-   huggingface_hub
-   sqlalchemy
-   python-dotenv
-   websockets
-   numpy
+uvicorn[standard]
+tensorflow
+opencv-python
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+pydantic
+numpy
+python-dotenv
+websockets
