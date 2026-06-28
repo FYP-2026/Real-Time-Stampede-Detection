@@ -3,14 +3,11 @@ import cv2
 import numpy as np
 from collections import deque
 import os
+import threading
+import queue
+import asyncio
+import datetime
 
-<<<<<<< HEAD
-MODEL_PATH = os.path.join(os.path.dirname(__file__), '67_precision49_recall.keras')
-
-
-def weighted_focal_loss(gamma=2.0, pos_weight=800.0):
-    bce = tf.keras.losses.BinaryFocalCrossentropy(gamma=gamma)
-=======
 MODEL_PATH = os.path.join(os.path.dirname(__file__), '217k_relu.keras')
 
 # Loss Function
@@ -26,8 +23,6 @@ def density_loss(
       + lambda_ssim * SSIM Loss
       + lambda_count * Count Loss
     """
-
->>>>>>> 312470256cfbb8d8aa65ad9da1dde35d62c42f89
     def loss(y_true, y_pred):
 
         # -------------------------------------------------
@@ -113,17 +108,32 @@ def count_metric(y_true, y_pred):
 
 def make_inference_fn(model, pred_threshold, image_size):
     h, w = image_size
-    @tf.function(input_signature=[tf.TensorSpec(shape=(1, h, w, 3), dtype=tf.float32)])
-    def infer(img_batch):
-        pred = model(img_batch, training=False)
-        pred = pred[0, ..., 0]
-        pred = tf.where(pred < pred_threshold, tf.zeros_like(pred), pred)
-        return pred
-    return infer
+    try:
+        # Attempt XLA compilation (jit_compile=True)
+        @tf.function(input_signature=[tf.TensorSpec(shape=(1, h, w, 3), dtype=tf.float32)], jit_compile=True)
+        def infer_jit(img_batch):
+            pred = model(img_batch, training=False)
+            pred = pred[0, ..., 0]
+            pred = tf.where(pred < pred_threshold, tf.zeros_like(pred), pred)
+            return pred
+        
+        # Warmup and test compilation
+        infer_jit(tf.zeros((1, h, w, 3), dtype=tf.float32))
+        print("TF inference compiled successfully with XLA (jit_compile=True).")
+        return infer_jit
+    except Exception as e:
+        print(f"XLA compilation failed or not supported ({e}). Falling back to standard tf.function.")
+        @tf.function(input_signature=[tf.TensorSpec(shape=(1, h, w, 3), dtype=tf.float32)])
+        def infer_standard(img_batch):
+            pred = model(img_batch, training=False)
+            pred = pred[0, ..., 0]
+            pred = tf.where(pred < pred_threshold, tf.zeros_like(pred), pred)
+            return pred
+        return infer_standard
 
 
 class CrowdModel:
-    def __init__(self, keras_model, pred_threshold=0.2, image_size=(400, 400)):
+    def __init__(self, keras_model, pred_threshold=0, image_size=(400, 400)):
         self.image_size  = image_size
         self.pred_threshold = pred_threshold
         H, W = image_size
@@ -132,13 +142,10 @@ class CrowdModel:
         self.img_batch = np.empty((1, H, W, 3), dtype=np.float32)
 
 
-def load_model(model_path=MODEL_PATH, pred_threshold=0.2, image_size=(400, 400)):
+def load_model(model_path=MODEL_PATH, pred_threshold=0, image_size=(400, 400)):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found at: {model_path}")
     keras_model = tf.keras.models.load_model(
-<<<<<<< HEAD
-        model_path, custom_objects={'loss': weighted_focal_loss()}
-=======
         model_path,
         custom_objects={'loss': density_loss(),
                         'pixel_mae': pixel_mae,
@@ -147,13 +154,12 @@ def load_model(model_path=MODEL_PATH, pred_threshold=0.2, image_size=(400, 400))
                         'psnr_metric': psnr_metric,
                         'count_metric': count_metric
                         }
->>>>>>> 312470256cfbb8d8aa65ad9da1dde35d62c42f89
     )
     print("TF crowd model loaded successfully.")
     return CrowdModel(keras_model, pred_threshold, image_size)
 
 
-def estimate_density(model, frame):
+def estimate_density(model, frame, img_batch=None):
     """
     Returns (density_score, density_map).
     density_score = sum of heatmap pixels (raw signal for calibration)
@@ -162,9 +168,114 @@ def estimate_density(model, frame):
     H, W = model.image_size
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame_rgb = cv2.resize(frame_rgb, (W, H))
-    np.multiply(frame_rgb, 1.0 / 255.0, out=model.img_batch[0])
-    pred_map = model.infer(model.img_batch).numpy()
+    if img_batch is None:
+        img_batch = model.img_batch
+    np.multiply(frame_rgb, 1.0 / 255.0, out=img_batch[0])
+    pred_map = model.infer(img_batch).numpy()
     return float(pred_map.sum()), pred_map
+
+
+class StreamProcessor:
+    """
+    Threaded pipeline processor for camera streams.
+    Decouples frame decoding, inference, motion analysis, and annotation
+    from the main event loop to ensure low latency and high FPS.
+    """
+    def __init__(self, model, camera_id, classifier_params):
+        self.model = model
+        self.camera_id = camera_id
+        self.h, self.w = model.image_size
+        
+        # Risk classifier & Motion analyzer
+        self.classifier = RiskClassifier(**classifier_params)
+        self.motion = MotionAnalyzer()
+        
+        # Thread-local pre-allocated buffer
+        self.img_batch = np.empty((1, self.h, self.w, 3), dtype=np.float32)
+        
+        # Bounded queues to keep latency low and avoid memory growth
+        self.input_q = queue.Queue(maxsize=2)
+        self.output_q = queue.Queue(maxsize=2)
+        
+        # Shutdown event
+        self.stop_event = threading.Event()
+        
+        # Start worker thread
+        self.thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.thread.start()
+
+    def _worker_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                frame_bytes = self.input_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            
+            # Check for poison pill
+            if frame_bytes is None or frame_bytes == b"":
+                break
+            
+            try:
+                # Decode the frame in the worker thread (CPU-heavy)
+                np_arr = np.frombuffer(frame_bytes, np.uint8)
+                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+                
+                # Estimate density (using thread-local pre-allocated img_batch)
+                density_score, density_map = estimate_density(
+                    self.model, frame, img_batch=self.img_batch
+                )
+                
+                # Analyze motion
+                motion = self.motion.analyze(frame)
+                
+                # Classify risk
+                result = self.classifier.update(density_score, motion=motion)
+                result["camera_id"] = self.camera_id
+                result["timestamp"] = datetime.datetime.utcnow().isoformat()
+                result["type"] = "camera_update"
+                
+                # Create annotated frame (using flow field and results)
+                annotated_jpeg = create_annotated_frame(
+                    frame, density_map, motion.get("flow"), result
+                )
+                
+                # Put results into output queue. Drop oldest frame if full to keep latency minimal.
+                try:
+                    self.output_q.put((annotated_jpeg, result), timeout=0.05)
+                except queue.Full:
+                    pass
+            except Exception as e:
+                print(f"[{self.camera_id}] Error in worker loop: {e}")
+
+    def process_frame(self, frame_bytes: bytes):
+        """Pushes raw frame bytes to the input queue. Drops if queue is full."""
+        try:
+            self.input_q.put_nowait(frame_bytes)
+        except queue.Full:
+            pass  # Drop frame to keep latency minimal
+
+    async def get_result(self):
+        """Asynchronously blocks and retrieves the next processed frame and result."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.output_q.get)
+
+    def stop(self):
+        """Shuts down the worker thread and releases resources."""
+        self.stop_event.set()
+        # Put poison pills to unblock any waiting gets/puts
+        try:
+            self.input_q.put_nowait(b"")
+        except queue.Full:
+            pass
+        try:
+            self.output_q.put_nowait(None)
+        except queue.Full:
+            pass
+            
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
 
 
 # ── Motion Analyzer ───────────────────────────────────────────────────
