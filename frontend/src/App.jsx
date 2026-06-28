@@ -7,7 +7,7 @@ import VolunteerAlert from "./pages/VolunteerAlert"
 
 function AdminRoute({ children }) {
   if (!authService.isLoggedIn() || !authService.isAdmin())
-    return <Navigate to="/" replace />
+    return <Navigate to="/admin/login" replace />
   return children
 }
 
@@ -21,11 +21,21 @@ export default function App() {
   return (
     <HashRouter>
       <Routes>
-        <Route path="/"                element={<AdminLogin />} />
+        {/* Admin routes */}
+        <Route path="/admin/login" element={<AdminLogin />} />
+        <Route path="/admin"       element={<AdminRoute><Dashboard /></AdminRoute>} />
+
+        {/* Volunteer routes */}
         <Route path="/volunteer/login" element={<VolunteerAuth />} />
-        <Route path="/dashboard"       element={<AdminRoute><Dashboard /></AdminRoute>} />
         <Route path="/volunteer"       element={<VolunteerRoute><VolunteerAlert /></VolunteerRoute>} />
-        <Route path="*"                element={<Navigate to="/" replace />} />
+
+        {/* Root redirect */}
+        <Route path="/" element={
+          authService.isAdmin()     ? <Navigate to="/admin"     replace /> :
+          authService.isVolunteer() ? <Navigate to="/volunteer" replace /> :
+                                      <Navigate to="/admin/login" replace />
+        } />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </HashRouter>
   )

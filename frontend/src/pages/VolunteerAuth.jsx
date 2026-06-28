@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom"
 import { authService } from "../services/auth"
 
 export default function VolunteerAuth() {
-  const [tab,      setTab]      = useState("login")   // "login" | "register"
+  const [tab,      setTab]      = useState("login")
   const [username, setUsername] = useState("")
   const [email,    setEmail]    = useState("")
   const [password, setPassword] = useState("")
@@ -52,29 +52,23 @@ export default function VolunteerAuth() {
   return (
     <div className="min-h-screen bg-gray-950 text-white font-mono flex items-center justify-center p-5">
       <div className="w-full max-w-sm">
-
-        {/* Logo */}
         <div className="text-center mb-8">
           <div className="text-5xl mb-3">🛡️</div>
           <h1 className="text-2xl font-black tracking-widest">CROWDSAFE</h1>
           <p className="text-xs text-gray-500 mt-1 tracking-wider">Volunteer Portal</p>
         </div>
 
-        {/* Tab switcher */}
         <div className="flex bg-gray-900 border border-gray-800 rounded-xl p-1 mb-4">
-          <button
-            onClick={() => { setTab("login"); resetForm() }}
+          <button onClick={() => { setTab("login"); resetForm() }}
             className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all ${tab === "login" ? "bg-emerald-700 text-white" : "text-gray-500 hover:text-gray-300"}`}>
             SIGN IN
           </button>
-          <button
-            onClick={() => { setTab("register"); resetForm() }}
+          <button onClick={() => { setTab("register"); resetForm() }}
             className={`flex-1 text-xs font-bold py-2 rounded-lg transition-all ${tab === "register" ? "bg-emerald-700 text-white" : "text-gray-500 hover:text-gray-300"}`}>
             REGISTER
           </button>
         </div>
 
-        {/* Login Form */}
         {tab === "login" && (
           <form onSubmit={handleLogin} className="bg-gray-900 border border-gray-800 rounded-2xl p-6 space-y-4">
             <div>
@@ -97,7 +91,6 @@ export default function VolunteerAuth() {
           </form>
         )}
 
-        {/* Register Form */}
         {tab === "register" && (
           <form onSubmit={handleRegister} className="bg-gray-900 border border-gray-800 rounded-2xl p-6 space-y-4">
             <div>
@@ -133,11 +126,10 @@ export default function VolunteerAuth() {
         )}
 
         <div className="text-center mt-5">
-          <button onClick={() => navigate("/")} className="text-xs text-gray-600 hover:text-gray-400 underline">
-            ← Back to Admin Login
+          <button onClick={() => navigate("/admin/login")} className="text-xs text-gray-600 hover:text-gray-400 underline">
+            ← Admin Login
           </button>
         </div>
-
       </div>
     </div>
   )

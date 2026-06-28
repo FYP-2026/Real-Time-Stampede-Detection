@@ -11,8 +11,7 @@ export default function AdminLogin() {
 
   async function handleLogin(e) {
     e.preventDefault()
-    setError("")
-    setLoading(true)
+    setError(""); setLoading(true)
     try {
       const data = await authService.login(username, password)
       if (data.role !== "admin") {
@@ -20,7 +19,7 @@ export default function AdminLogin() {
         setError("This login is for admins only. Use the Volunteer portal instead.")
         return
       }
-      navigate("/dashboard")
+      navigate("/admin")
     } catch (err) {
       setError(err.message)
     } finally {
@@ -31,7 +30,6 @@ export default function AdminLogin() {
   return (
     <div className="min-h-screen bg-gray-950 text-white font-mono flex items-center justify-center p-5">
       <div className="w-full max-w-sm">
-
         <div className="text-center mb-10">
           <div className="text-6xl mb-4">🛡️</div>
           <h1 className="text-3xl font-black tracking-widest uppercase">CrowdSafe</h1>
@@ -45,20 +43,15 @@ export default function AdminLogin() {
               placeholder="Enter username" required
               className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-colors" />
           </div>
-
           <div>
             <label className="text-xs text-gray-500 uppercase tracking-widest block mb-1.5">Password</label>
             <input type="password" value={password} onChange={e => setPassword(e.target.value)}
               placeholder="••••••••" required
               className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 transition-colors" />
           </div>
-
           {error && (
-            <div className="bg-red-950 border border-red-800 rounded-xl px-4 py-3 text-xs text-red-400">
-              {error}
-            </div>
+            <div className="bg-red-950 border border-red-800 rounded-xl px-4 py-3 text-xs text-red-400">{error}</div>
           )}
-
           <button type="submit" disabled={loading}
             className="w-full bg-blue-700 hover:bg-blue-600 disabled:opacity-50 text-white font-black text-sm py-3.5 rounded-xl tracking-widest transition-all">
             {loading ? "SIGNING IN..." : "SIGN IN AS ADMIN"}
@@ -72,7 +65,6 @@ export default function AdminLogin() {
             Go to Volunteer Portal →
           </button>
         </div>
-
       </div>
     </div>
   )
