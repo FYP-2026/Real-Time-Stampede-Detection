@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from jose import JWTError, jwt
 import cv2, numpy as np, datetime, base64
 import asyncio
+from typing import Optional
 
 from app.ml.crowd_monitor import (
     load_model, estimate_density, RiskClassifier,
@@ -130,32 +131,40 @@ async def volunteer_ws(websocket: WebSocket, vol_name: str, token: str = Query(.
 async def camera_ws(
     websocket:         WebSocket,
     camera_id:         str,
-    token:             str   = Query(...),
-    area_sqm:          float = Query(default=25.0),
-    score_to_count:    float = Query(default=0.005),
+    token:             str            = Query(...),
+    width_m:           float          = Query(default=5.0),
+    height_m:          float          = Query(default=5.0),
+    area_sqm:          float          = Query(default=25.0),
+    score_to_count:    float          = Query(default=1.0),
     # Fruin density thresholds (people/m²) — set per camera by admin
-    density_medium:    float = Query(default=1.5),
-    density_high:      float = Query(default=2.5),
-    density_very_high: float = Query(default=4.5),
+    density_medium:    float          = Query(default=1.5),
+    density_high:      float          = Query(default=2.5),
+    density_very_high: float          = Query(default=4.5),
     # Chaos thresholds (0.0–1.0)
-    chaos_medium:      float = Query(default=0.45),
-    chaos_high:        float = Query(default=0.65),
-    chaos_very_high:   float = Query(default=0.80),
+    chaos_medium:      float          = Query(default=0.45),
+    chaos_high:        float          = Query(default=0.65),
+    chaos_very_high:   float          = Query(default=0.80),
     # Speed thresholds (px/frame)
-    speed_high:        float = Query(default=5.0),
-    speed_very_high:   float = Query(default=7.0),
+    speed_high:        float          = Query(default=5.0),
+    speed_very_high:   float          = Query(default=7.0),
+    # Optional RTSP stream URL — backend will capture frames directly
+    rtsp_url:          Optional[str]  = Query(default=None),
 ):
     if not verify_ws_token(token, required_role="admin"):
         await websocket.close(code=4001); return
 
     await websocket.accept()
 
+    calculated_area = width_m * height_m
+
     # Initialize multi-threaded stream processor for this camera connection
     processor = StreamProcessor(
         model=model,
         camera_id=camera_id,
         classifier_params={
-            "camera_area_sqm": area_sqm,
+            "camera_area_sqm": calculated_area,
+            "width_m": width_m,
+            "height_m": height_m,
             "score_to_count": score_to_count,
             "density_medium": density_medium,
             "density_high": density_high,
@@ -171,6 +180,7 @@ async def camera_ws(
     camera_processors[camera_id] = processor
 
     async def receive_loop():
+        """Receive raw JPEG frames from the browser (webcam / video file mode)."""
         try:
             while True:
                 data = await websocket.receive_bytes()
@@ -179,6 +189,34 @@ async def camera_ws(
             pass
         except Exception as e:
             print(f"[{camera_id}] Error in receive loop: {e}")
+
+    async def rtsp_capture_loop():
+        """Capture frames directly from an RTSP stream using OpenCV."""
+        loop = asyncio.get_event_loop()
+        cap  = await loop.run_in_executor(None, cv2.VideoCapture, rtsp_url)
+        if not cap.isOpened():
+            print(f"[{camera_id}] Failed to open RTSP stream: {rtsp_url}")
+            await websocket.close()
+            return
+        print(f"[{camera_id}] RTSP stream opened: {rtsp_url}")
+        try:
+            while True:
+                ret, frame = await loop.run_in_executor(None, cap.read)
+                if not ret:
+                    print(f"[{camera_id}] RTSP stream ended or lost.")
+                    break
+                # Encode frame as JPEG and push into the processor
+                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if ok:
+                    processor.process_frame(buf.tobytes())
+                await asyncio.sleep(0.033)  # ~30 fps cap
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[{camera_id}] RTSP capture error: {e}")
+        finally:
+            cap.release()
+            print(f"[{camera_id}] RTSP capture released.")
 
     async def send_loop():
         db = next(get_db())
@@ -234,18 +272,22 @@ async def camera_ws(
         finally:
             db.close()
 
-    receive_task = asyncio.create_task(receive_loop())
+    # Choose source: RTSP (backend captures) vs browser frames (websocket)
+    if rtsp_url:
+        source_task = asyncio.create_task(rtsp_capture_loop())
+    else:
+        source_task = asyncio.create_task(receive_loop())
     send_task = asyncio.create_task(send_loop())
 
     try:
-        # Wait until either the receiver or sender stops
+        # Wait until either the source or sender stops
         done, pending = await asyncio.wait(
-            [receive_task, send_task],
+            [source_task, send_task],
             return_when=asyncio.FIRST_COMPLETED
         )
     finally:
         # Cancel whatever is still running
-        for task in [receive_task, send_task]:
+        for task in [source_task, send_task]:
             if not task.done():
                 task.cancel()
                 try:

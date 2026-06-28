@@ -339,7 +339,9 @@ class RiskClassifier:
     """
     def __init__(self,
                  camera_area_sqm=25.0,
-                 score_to_count=0.005,
+                 width_m=5.0,
+                 height_m=5.0,
+                 score_to_count=1.0,
                  window=3,
                  # Fruin density thresholds (people/m²) — configurable per camera
                  density_very_high=4.5,
@@ -353,7 +355,9 @@ class RiskClassifier:
                  speed_very_high=7.0,
                  speed_high=5.0):
 
-        self.camera_area_sqm   = max(camera_area_sqm, 1.0)
+        self.width_m           = width_m
+        self.height_m          = height_m
+        self.camera_area_sqm   = max(width_m * height_m, 1.0)
         self.score_to_count    = score_to_count
         self.buffer            = deque(maxlen=window)
         self.density_very_high = density_very_high
@@ -413,6 +417,8 @@ class RiskClassifier:
             "chaos_score": round(chaos, 3),
             "risk":        risk,
             "area_sqm":    self.camera_area_sqm,
+            "width_m":     self.width_m,
+            "height_m":    self.height_m,
         }
 
 

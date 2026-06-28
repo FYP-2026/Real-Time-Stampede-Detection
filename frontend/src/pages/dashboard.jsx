@@ -14,8 +14,8 @@ const PRIORITY    = { "No Risk": 0, "Medium Risk": 1, "High Alert": 2, "Very Hig
 const CHART_COLOR = { "No Risk": "#10b981", "Medium Risk": "#f59e0b", "High Alert": "#f97316", "Very High Risk": "#ef4444" }
 
 const DEFAULT_CAMERAS = [
-  { id: "MAIN-GATE",     name: "Main Gate",     area_sqm: 25.0 },
-  { id: "EAST-ENTRANCE", name: "East Entrance", area_sqm: 25.0 },
+  { id: "MAIN-GATE",     name: "Main Gate",     width_m: 5.0, height_m: 5.0, area_sqm: 25.0 },
+  { id: "EAST-ENTRANCE", name: "East Entrance", width_m: 5.0, height_m: 5.0, area_sqm: 25.0 },
 ]
 
 const initState = (cameras) =>
@@ -37,7 +37,8 @@ export default function Dashboard() {
   const user     = authService.getUser()
 
 
-  const [newCamArea,        setNewCamArea]        = useState("25")
+  const [newCamWidth,       setNewCamWidth]       = useState("5.0")
+  const [newCamHeight,      setNewCamHeight]      = useState("5.0")
   const [newDensityHigh,    setNewDensityHigh]    = useState("2.5")
   const [newDensityVHigh,   setNewDensityVHigh]   = useState("4.5")
   const [newChaosHigh,      setNewChaosHigh]      = useState("0.65")
@@ -64,6 +65,11 @@ export default function Dashboard() {
   const [showVolPanel, setShowVolPanel] = useState(false)
   const [showProfile,  setShowProfile]  = useState(false)
   const [newCamName,   setNewCamName]   = useState("")
+
+  // ── RTSP per-camera state ─────────────────────────────────────────
+  const [rtspInputCam,  setRtspInputCam]  = useState(null)   // camId showing RTSP input
+  const [rtspUrlDraft,  setRtspUrlDraft]  = useState("")     // typed RTSP URL
+  const [camRtspUrls,   setCamRtspUrls]   = useState({})     // camId → active RTSP URL
 
   // ── Profile form ──────────────────────────────────────────────────
   const [profileTab,  setProfileTab]  = useState("password")
@@ -187,9 +193,14 @@ export default function Dashboard() {
   if (!name) return
   const id = name.toUpperCase().replace(/\s+/g, "-")
   if (cameras.find(c => c.id === id)) return
+  const w = parseFloat(newCamWidth) || 5.0
+  const h = parseFloat(newCamHeight) || 5.0
+  const area = w * h
   setCameras(prev => [...prev, {
     id, name,
-    area_sqm:          parseFloat(newCamArea)       || 25.0,
+    width_m:           w,
+    height_m:          h,
+    area_sqm:          area,
     density_high:      parseFloat(newDensityHigh)   || 2.5,
     density_very_high: parseFloat(newDensityVHigh)  || 4.5,
     chaos_high:        parseFloat(newChaosHigh)     || 0.65,
@@ -201,7 +212,7 @@ export default function Dashboard() {
     ...prev,
     [id]: { risk: "No Risk", density: 0, est_count: 0, avg_speed: 0, chaos_score: 0, active: false }
   }))
-  setNewCamName(""); setNewCamArea("25")
+  setNewCamName(""); setNewCamWidth("5.0"); setNewCamHeight("5.0")
   setNewDensityHigh("2.5"); setNewDensityVHigh("4.5")
   setNewChaosHigh("0.65"); setNewChaosVHigh("0.80")
   setNewSpeedHigh("5.0"); setNewSpeedVHigh("7.0")
@@ -215,22 +226,86 @@ export default function Dashboard() {
     if (selected === camId) setSelected(cameras[0]?.id)
   }
 
-  async function startCamera(camId, videoFile) {
+  function updateCameraDimensions(camId, w, h) {
+    setCameras(prev => prev.map(c => {
+      if (c.id === camId) {
+        return { ...c, width_m: w, height_m: h, area_sqm: w * h }
+      }
+      return c
+    }))
+
+    // If active, restart WS connection with new parameters
+    if (camStates[camId]?.active) {
+      clearInterval(intervalRefs.current[camId])
+      const oldWs = cameraWsRefs.current[camId]
+      if (oldWs) {
+        oldWs.close()
+      }
+
+      const cam = cameras.find(c => c.id === camId)
+      const densityHigh = cam?.density_high || 2.5
+      const densityVeryHigh = cam?.density_very_high || 4.5
+      const chaosHigh = cam?.chaos_high || 0.65
+      const chaosVeryHigh = cam?.chaos_very_high || 0.80
+      const speedHigh = cam?.speed_high || 5.0
+      const speedVeryHigh = cam?.speed_very_high || 7.0
+
+      const params = new URLSearchParams({
+        width_m:           w,
+        height_m:          h,
+        area_sqm:          w * h,
+        score_to_count:    1.0,
+        density_high:      densityHigh,
+        density_very_high: densityVeryHigh,
+        chaos_high:        chaosHigh,
+        chaos_very_high:   chaosVeryHigh,
+        speed_high:        speedHigh,
+        speed_very_high:   speedVeryHigh,
+      })
+
+      const ws = new WebSocket(authService.wsUrl(`/ws/camera/${camId}`) + `&${params.toString()}`)
+      cameraWsRefs.current[camId] = ws
+      ws.onmessage = (e) => {
+        const blob = new Blob([e.data], { type: "image/jpeg" })
+        const url  = URL.createObjectURL(blob)
+        if (annotatedUrlRefs.current[camId]) URL.revokeObjectURL(annotatedUrlRefs.current[camId])
+        annotatedUrlRefs.current[camId] = url
+        setAnnotatedFrames(prev => ({ ...prev, [camId]: url }))
+      }
+      ws.onopen = () => {
+        const video = videoRefs.current[camId]
+        intervalRefs.current[camId] = setInterval(() => {
+          if (ws.readyState !== WebSocket.OPEN) return
+          if (!video) return
+          const canvas = document.createElement("canvas")
+          canvas.width = 320; canvas.height = 240
+          canvas.getContext("2d").drawImage(video, 0, 0, 320, 240)
+          canvas.toBlob(blob => blob?.arrayBuffer().then(buf => ws.send(buf)), "image/jpeg", 0.7)
+        }, 1000)
+      }
+    }
+  }
+
+  async function startCamera(camId, videoFile, rtspUrl) {
   const video = videoRefs.current[camId]
   if (!video) return
-  if (videoFile) {
-    video.src = URL.createObjectURL(videoFile)
-    video.loop = true; video.play()
-  } else {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true })
-      video.srcObject = stream
-    } catch { alert("Camera access denied."); return }
-  }
+    if (videoFile) {
+      video.src = URL.createObjectURL(videoFile)
+      video.loop = true; video.play()
+    } else if (rtspUrl) {
+      // RTSP stream will be handled by backend, no local video source needed
+    } else {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+        video.srcObject = stream
+      } catch { alert("Camera access denied."); return }
+    }
   const cam = cameras.find(c => c.id === camId)
   const params = new URLSearchParams({
+    width_m:           cam?.width_m           || 5.0,
+    height_m:          cam?.height_m          || 5.0,
     area_sqm:          cam?.area_sqm          || 25.0,
-    score_to_count:    0.005,
+    score_to_count:    1.0,
     density_high:      cam?.density_high      || 2.5,
     density_very_high: cam?.density_very_high || 4.5,
     chaos_high:        cam?.chaos_high        || 0.65,
@@ -238,6 +313,7 @@ export default function Dashboard() {
     speed_high:        cam?.speed_high        || 5.0,
     speed_very_high:   cam?.speed_very_high   || 7.0,
   })
+  if (rtspUrl) params.set("rtsp_url", rtspUrl)
   const ws = new WebSocket(authService.wsUrl(`/ws/camera/${camId}`) + `&${params.toString()}`)
   cameraWsRefs.current[camId] = ws
   ws.onmessage = (e) => {
@@ -250,12 +326,15 @@ export default function Dashboard() {
   ws.onopen = () => {
     intervalRefs.current[camId] = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return
+      // RTSP mode: backend captures frames, no browser-side sending needed
+      if (rtspUrl) return
       const canvas = document.createElement("canvas")
       canvas.width = 320; canvas.height = 240
       canvas.getContext("2d").drawImage(video, 0, 0, 320, 240)
       canvas.toBlob(blob => blob?.arrayBuffer().then(buf => ws.send(buf)), "image/jpeg", 0.7)
     }, 1000)
   }
+  if (rtspUrl) setCamRtspUrls(prev => ({ ...prev, [camId]: rtspUrl }))
   setCamStates(prev => ({ ...prev, [camId]: { ...prev[camId], active: true } }))
   }
 
@@ -273,6 +352,7 @@ export default function Dashboard() {
       delete annotatedUrlRefs.current[camId]
     }
     setAnnotatedFrames(prev => { const n = { ...prev }; delete n[camId]; return n })
+    setCamRtspUrls(prev => { const n = { ...prev }; delete n[camId]; return n })
     setCamStates(prev => ({
       ...prev,
       [camId]: { ...prev[camId], active: false, risk: "No Risk", density: 0, est_count: 0, avg_speed: 0, chaos_score: 0 }
@@ -449,30 +529,73 @@ export default function Dashboard() {
                   </div>
 
                   {/* Controls bar */}
-                  <div className="flex items-center justify-between px-3 py-2 bg-gray-900" onClick={e => e.stopPropagation()}>
-                    <span className="text-xs text-gray-600">{cam.id} · {cam.area_sqm}m²</span>
-                    <div className="flex gap-1">
-                      {!state.active ? (
-                        <>
-                          <label className="cursor-pointer bg-blue-800 hover:bg-blue-700 text-white text-xs px-2 py-1 rounded" title="Load video file">
-                            📁
-                            <input type="file" accept="video/*" className="hidden"
-                              onChange={e => e.target.files[0] && startCamera(cam.id, e.target.files[0])} />
-                          </label>
-                          <button onClick={() => startCamera(cam.id, null)} title="Use webcam"
-                            className="bg-emerald-800 hover:bg-emerald-700 text-white text-xs px-2 py-1 rounded">
-                            📷
-                          </button>
-                        </>
-                      ) : (
-                        <button onClick={() => stopCamera(cam.id)}
-                          className="bg-red-800 hover:bg-red-700 text-white text-xs px-2 py-1 rounded">
-                          ⏹ Stop
-                        </button>
+                  <div className="bg-gray-900" onClick={e => e.stopPropagation()}>
+                    <div className="flex items-center justify-between px-3 py-2">
+                      <span className="text-xs text-gray-600">{cam.id} · {cam.area_sqm}m²</span>
+                      {camRtspUrls[cam.id] && (
+                        <span className="text-xs text-purple-400 font-mono truncate max-w-[120px]" title={camRtspUrls[cam.id]}>📡 {camRtspUrls[cam.id]}</span>
                       )}
-                      <button onClick={() => removeCamera(cam.id)} title="Remove"
-                        className="bg-gray-700 hover:bg-gray-600 text-white text-xs px-2 py-1 rounded">✕</button>
+                      <div className="flex gap-1">
+                        {!state.active ? (
+                          <>
+                            <label className="cursor-pointer bg-blue-800 hover:bg-blue-700 text-white text-xs px-2 py-1 rounded" title="Load video file">
+                              📁
+                              <input type="file" accept="video/*" className="hidden"
+                                onChange={e => e.target.files[0] && startCamera(cam.id, e.target.files[0], null)} />
+                            </label>
+                            <button onClick={() => startCamera(cam.id, null, null)} title="Use webcam"
+                              className="bg-emerald-800 hover:bg-emerald-700 text-white text-xs px-2 py-1 rounded">
+                              📷
+                            </button>
+                            <button
+                              onClick={() => { setRtspInputCam(rtspInputCam === cam.id ? null : cam.id); setRtspUrlDraft("") }}
+                              title="Stream RTSP"
+                              className="bg-purple-800 hover:bg-purple-700 text-white text-xs px-2 py-1 rounded">
+                              📡
+                            </button>
+                          </>
+                        ) : (
+                          <button onClick={() => stopCamera(cam.id)}
+                            className="bg-red-800 hover:bg-red-700 text-white text-xs px-2 py-1 rounded">
+                            ⏹ Stop
+                          </button>
+                        )}
+                        <button onClick={() => removeCamera(cam.id)} title="Remove"
+                          className="bg-gray-700 hover:bg-gray-600 text-white text-xs px-2 py-1 rounded">✕</button>
+                      </div>
                     </div>
+
+                    {/* RTSP inline input — shown when 📡 is clicked */}
+                    {!state.active && rtspInputCam === cam.id && (
+                      <div className="px-3 pb-3 flex gap-2 items-center border-t border-gray-800 pt-2">
+                        <span className="text-purple-400 text-xs flex-shrink-0">📡</span>
+                        <input
+                          type="text"
+                          value={rtspUrlDraft}
+                          onChange={e => setRtspUrlDraft(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === "Enter" && rtspUrlDraft.trim()) {
+                              startCamera(cam.id, null, rtspUrlDraft.trim())
+                              setRtspInputCam(null)
+                            }
+                            if (e.key === "Escape") setRtspInputCam(null)
+                          }}
+                          placeholder="rtsp://user:pass@ip:554/stream"
+                          autoFocus
+                          className="flex-1 bg-gray-800 border border-purple-800 rounded px-2 py-1 text-xs text-white placeholder-gray-600 focus:outline-none focus:border-purple-500"
+                        />
+                        <button
+                          onClick={() => {
+                            if (rtspUrlDraft.trim()) {
+                              startCamera(cam.id, null, rtspUrlDraft.trim())
+                              setRtspInputCam(null)
+                            }
+                          }}
+                          className="bg-purple-700 hover:bg-purple-600 text-white text-xs px-2 py-1 rounded flex-shrink-0 font-bold">
+                          Connect
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               )
@@ -515,20 +638,58 @@ export default function Dashboard() {
             <p className="text-xs text-gray-500 tracking-widest uppercase mb-2">{selName} — Density</p>
             <div className="bg-gray-900 rounded-xl p-3 space-y-3">
 
-              {/* Primary metric */}
+              {/* Primary metric & Total Count */}
               <div className="bg-gray-800 rounded-xl p-3 text-center">
                 <p className="text-xs text-gray-500 mb-1">People / m²</p>
                 <p className={`text-3xl font-black ${RISK_CONFIG[selState.risk]?.text || "text-white"}`}>
                   {typeof selState.density === "number" ? selState.density.toFixed(2) : "0.00"}
                 </p>
-                <p className="text-xs text-gray-500 mt-1">
+                <p className="text-xs text-gray-500 mt-1 mb-3">
                   {fruinLabel(selState.density || 0)}
-                  {" · "}~{Math.round(selState.est_count || 0)} people
                 </p>
-                {selCam && (
-                  <p className="text-xs text-gray-600 mt-0.5">Area: {selCam.area_sqm} m²</p>
-                )}
+                
+                <div className="border-t border-gray-700 pt-3">
+                  <p className="text-xs text-gray-500 mb-1">Total Count</p>
+                  <p className="text-2xl font-black text-white">
+                    {typeof selState.est_count === "number" ? Math.round(selState.est_count) : "0"}
+                  </p>
+                  <p className="text-[10px] text-gray-500 mt-0.5">Estimated people in zone</p>
+                </div>
               </div>
+
+              {/* Dimensions Config */}
+              {/*selCam && (
+                <div className="bg-gray-800 rounded-xl p-3 space-y-2">
+                  <p className="text-[10px] text-gray-500 uppercase tracking-widest text-center">Dimensions (Meters)</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-[10px] text-gray-600 block mb-0.5">Width (w)</label>
+                      <input
+                        type="number"
+                        min="0.5"
+                        step="0.5"
+                        value={selCam.width_m || 5.0}
+                        onChange={(e) => updateCameraDimensions(selected, parseFloat(e.target.value) || 1.0, selCam.height_m || 5.0)}
+                        className="w-full bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-[10px] text-gray-600 block mb-0.5">Height (h)</label>
+                      <input
+                        type="number"
+                        min="0.5"
+                        step="0.5"
+                        value={selCam.height_m || 5.0}
+                        onChange={(e) => updateCameraDimensions(selected, selCam.width_m || 5.0, parseFloat(e.target.value) || 1.0)}
+                        className="w-full bg-gray-950 border border-gray-700 rounded px-2 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-gray-500 text-center pt-1">
+                    Area: {((selCam.width_m || 5.0) * (selCam.height_m || 5.0)).toFixed(1)} m²
+                  </p>
+                </div>
+              )*/}
 
               {/* Fruin scale reference */}
               <div className="text-xs space-y-1">
@@ -752,16 +913,27 @@ export default function Dashboard() {
             autoFocus />
         </div>
         <div>
-          <label className="text-xs text-gray-500 uppercase tracking-widest block mb-1">Area (m²)</label>
-          <input type="number" value={newCamArea} onChange={e => setNewCamArea(e.target.value)}
-            min="1" step="0.5" placeholder="e.g. 25"
+          <label className="text-xs text-gray-500 uppercase tracking-widest block mb-1">Width (m)</label>
+          <input type="number" value={newCamWidth} onChange={e => setNewCamWidth(e.target.value)}
+            min="0.5" step="0.5" placeholder="e.g. 5.0"
             className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
         </div>
-        <div className="bg-gray-800/50 rounded-xl p-2 text-xs text-gray-500 space-y-0.5">
-          <p className="text-gray-400 font-bold">Quick ref:</p>
-          <p>Gate 5×5m → 25m²</p>
-          <p>Open 10×10m → 100m²</p>
-          <p>Corridor 20×3m → 60m²</p>
+        <div>
+          <label className="text-xs text-gray-500 uppercase tracking-widest block mb-1">Height (m)</label>
+          <input type="number" value={newCamHeight} onChange={e => setNewCamHeight(e.target.value)}
+            min="0.5" step="0.5" placeholder="e.g. 5.0"
+            className="w-full bg-gray-800 border border-gray-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+        </div>
+        <div className="col-span-2 bg-gray-800/50 rounded-xl p-3 text-xs text-gray-500 flex justify-between items-center">
+          <div>
+            <p className="text-gray-400 font-bold">Calculated Area:</p>
+            <p className="text-lg font-black text-white">{(parseFloat(newCamWidth || 5.0) * parseFloat(newCamHeight || 5.0)).toFixed(1)} m²</p>
+          </div>
+          <div className="space-y-0.5 text-right">
+            <p className="text-gray-400 font-bold">Quick ref:</p>
+            <p>Gate: 5×5m → 25m²</p>
+            <p>Corridor: 20×3m → 60m²</p>
+          </div>
         </div>
       </div>
 
