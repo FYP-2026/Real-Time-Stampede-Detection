@@ -4,15 +4,111 @@ import numpy as np
 from collections import deque
 import os
 
+<<<<<<< HEAD
 MODEL_PATH = os.path.join(os.path.dirname(__file__), '67_precision49_recall.keras')
 
 
 def weighted_focal_loss(gamma=2.0, pos_weight=800.0):
     bce = tf.keras.losses.BinaryFocalCrossentropy(gamma=gamma)
+=======
+MODEL_PATH = os.path.join(os.path.dirname(__file__), '217k_relu.keras')
+
+# Loss Function
+def density_loss(
+    lambda_ssim=0.2,
+    lambda_count=0.05
+):
+    """
+    Composite Density Map Loss
+
+    Total Loss =
+      MSE
+      + lambda_ssim * SSIM Loss
+      + lambda_count * Count Loss
+    """
+
+>>>>>>> 312470256cfbb8d8aa65ad9da1dde35d62c42f89
     def loss(y_true, y_pred):
-        weights = 1.0 + y_true * (pos_weight - 1.0)
-        return tf.reduce_mean(bce(y_true, y_pred) * tf.squeeze(weights, -1))
+
+        # -------------------------------------------------
+        # 1. Pixel-wise MSE
+        # -------------------------------------------------
+        mse = tf.reduce_mean(
+            tf.square(y_true - y_pred)
+        )
+
+        # -------------------------------------------------
+        # 2. Structural Similarity Loss
+        # -------------------------------------------------
+        ssim = tf.image.ssim(
+            tf.clip_by_value(y_true, 0., 1.),
+            tf.clip_by_value(y_pred, 0., 1.),
+            max_val=1.0
+        )
+        ssim_loss = 1.0 - tf.reduce_mean(ssim)
+
+        # -------------------------------------------------
+        # 3. Count Loss
+        # Sum of density map = crowd count
+        # -------------------------------------------------
+        pred_count = tf.reduce_sum(y_pred, axis=[1, 2, 3])
+        true_count = tf.reduce_sum(y_true, axis=[1, 2, 3])
+
+        count_loss = tf.reduce_mean(
+            tf.abs(pred_count - true_count) /
+            (true_count + 1.0)
+        )
+
+        # -------------------------------------------------
+        # Total Loss
+        # -------------------------------------------------
+        total_loss = (
+            mse
+            + lambda_ssim * ssim_loss
+            + lambda_count * count_loss
+        )
+
+        return total_loss
+
     return loss
+
+# Metrics
+
+def pixel_mae(y_true, y_pred):
+    return tf.reduce_mean(tf.abs(y_true - y_pred))
+
+
+def pixel_rmse(y_true, y_pred):
+    return tf.sqrt(
+        tf.reduce_mean(tf.square(y_true - y_pred))
+    )
+
+
+def ssim_metric(y_true, y_pred):
+    return tf.reduce_mean(
+        tf.image.ssim(
+            y_true,
+            y_pred,
+            max_val=1.0
+        )
+    )
+
+
+def psnr_metric(y_true, y_pred):
+    return tf.reduce_mean(
+        tf.image.psnr(
+            y_true,
+            y_pred,
+            max_val=1.0
+        )
+    )
+
+def count_metric(y_true, y_pred):
+    pred_count = tf.reduce_sum(y_pred, axis=[1, 2, 3])
+    true_count = tf.reduce_sum(y_true, axis=[1, 2, 3])
+    return tf.reduce_mean(
+        tf.abs((pred_count - true_count)/(true_count+1))
+    )
 
 
 def make_inference_fn(model, pred_threshold, image_size):
@@ -40,7 +136,18 @@ def load_model(model_path=MODEL_PATH, pred_threshold=0.2, image_size=(400, 400))
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found at: {model_path}")
     keras_model = tf.keras.models.load_model(
+<<<<<<< HEAD
         model_path, custom_objects={'loss': weighted_focal_loss()}
+=======
+        model_path,
+        custom_objects={'loss': density_loss(),
+                        'pixel_mae': pixel_mae,
+                        'pixel_rmse': pixel_rmse,
+                        'ssim_metric': ssim_metric,
+                        'psnr_metric': psnr_metric,
+                        'count_metric': count_metric
+                        }
+>>>>>>> 312470256cfbb8d8aa65ad9da1dde35d62c42f89
     )
     print("TF crowd model loaded successfully.")
     return CrowdModel(keras_model, pred_threshold, image_size)
